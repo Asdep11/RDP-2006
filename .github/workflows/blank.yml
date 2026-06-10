@@ -1,83 +1,146 @@
 name: RDP via Tailscale
+
 on:
   workflow_dispatch:
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 180
+    # Maksimal timeout (sesuaikan dengan tipe repo Anda)
+    timeout-minutes: 4320   # 72 jam (GitHub akan stop otomatis jika melebihi limit akun Anda)
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 1️⃣ Aktifkan RDP dan firewall
+      # 1️⃣ Aktifkan RDP + Firewall
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
-          Write-Host "🔧 Mengaktifkan RDP dan membuka firewall..."
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "🔧 Mengaktifkan Remote Desktop..." -ForegroundColor Cyan
+          
+          # Enable RDP
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Enable Firewall Rule
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          
+          # Restart TermService
           Restart-Service -Name TermService -Force
-          Write-Host "✅ Remote Desktop sudah aktif."
+          
+          # Network Level Authentication (lebih aman)
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -Force
+          
+          Write-Host "✅ Remote Desktop aktif." -ForegroundColor Green
 
-      # 2️⃣ Buat user dengan password aman (≤14 karakter, ASCII khusus dihindari)
+      # 2️⃣ Buat User RDP
       - name: Create Local Admin User
-        id: user
+        id: create_user
         shell: pwsh
         run: |
-          $password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 12 | ForEach-Object {[char]$_})
-          net user RDP $password /add /Y
-          net localgroup administrators RDP /add
+          # Generate password yang kuat tapi mudah dibaca
+          $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 14 | ForEach-Object {[char]$_})
+          $password += "@"  # tambah karakter spesial
+          
+          net user RDP $password /add /Y | Out-Null
+          net localgroup administrators RDP /add | Out-Null
+          
           Add-Content $env:GITHUB_ENV "RDP_PASSWORD=$password"
-          Write-Host "✅ User RDP dibuat: RDP / $password"
+          
+          Write-Host "👤 Username : RDP" -ForegroundColor Green
+          Write-Host "🔑 Password : $password" -ForegroundColor Green
 
-      # 3️⃣ Instal Tailscale menggunakan EXE (hindari MSI error)
-      - name: Install Tailscale Client
+      # 3️⃣ Install Tailscale
+      - name: Install Tailscale
         shell: pwsh
         run: |
-          Write-Host "📦 Menginstal Tailscale..."
+          Write-Host "📦 Menginstal Tailscale..." -ForegroundColor Cyan
           $exe = "$env:TEMP\tailscale-setup.exe"
+          
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $exe
           Start-Process $exe -ArgumentList "/quiet /norestart" -Wait
-          Write-Host "✅ Instalasi Tailscale selesai."
+          
+          # Tunggu sampai tailscale.exe tersedia
+          $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+          while (-not (Test-Path $tsPath)) { Start-Sleep -Seconds 3 }
+          
+          Write-Host "✅ Tailscale terinstal." -ForegroundColor Green
 
-      # 4️⃣ Hubungkan runner ke jaringan Tailscale
-      - name: Connect to Tailscale Network
+      # 4️⃣ Connect ke Tailscale
+      - name: Connect to Tailscale
         shell: pwsh
+        env:
+          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          $authkey = "${{ secrets.TS_AUTH_KEY }}"
-          if ([string]::IsNullOrEmpty($authkey)) {
-            Write-Host "⚠️ Auth Key tidak ditemukan! Jalankan login manual..."
-            & $ts up --hostname=gh-runner-${{ github.run_id }} --accept-dns=true --accept-routes=true
-          } else {
-            Write-Host "🔐 Menghubungkan node ke Tailnet..."
-            & $ts up --auth-key=$authkey --hostname=gh-runner-${{ github.run_id }} --accept-dns=true --accept-routes=true
+          
+          Write-Host "🔐 Menghubungkan ke Tailnet..." -ForegroundColor Cyan
+          
+          $hostname = "gh-rdp-${{ github.run_id }}"
+          
+          $args = @(
+            "up",
+            "--auth-key=$env:TS_AUTH_KEY",
+            "--hostname=$hostname",
+            "--accept-dns=true",
+            "--accept-routes=true",
+            "--unattended=true",           # Penting untuk kestabilan
+            "--reset"
+          )
+          
+          & $ts @args
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "⚠️ Gagal connect, mencoba login manual..." -ForegroundColor Yellow
+            & $ts up --hostname=$hostname --accept-dns=true --accept-routes=true --unattended=true
           }
-          if ($LASTEXITCODE -ne 0) { throw "❌ Gagal connect ke Tailnet." }
-          Write-Host "✅ Node tersambung ke Tailnet."
+          
+          # Cek status
+          Start-Sleep -Seconds 5
+          & $ts status
 
-      # 5️⃣ Tampilkan IP Tailscale dan kredensial akses RDP
+      # 5️⃣ Tampilkan Informasi Akses
       - name: Display Access Information
         shell: pwsh
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $ip = & $ts ip -4
-          Write-Host "`n==============================="
-          Write-Host "✅ Tailscale dan RDP Siap Digunakan"
-          Write-Host "🌐 IP Tailscale: $ip"
-          Write-Host "👤 Username: RDP"
-          Write-Host "🔑 Password: $env:RDP_PASSWORD"
-          Write-Host "Gunakan aplikasi mstsc.exe dengan IP di atas."
-          Write-Host "==============================="
+          $dns = & $ts status --json | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName
+          
+          Write-Host "`n" -NoNewline
+          Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║                ✅ RDP VIA TAILSCALE SIAP                     ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║ 🌐 Tailscale IP     : $ip" -ForegroundColor White
+          if ($dns) { Write-Host "║ 🔗 MagicDNS         : $dns" -ForegroundColor White }
+          Write-Host "║ 👤 Username         : RDP" -ForegroundColor White
+          Write-Host "║ 🔑 Password         : $env:RDP_PASSWORD" -ForegroundColor White
+          Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+          
+          Write-Host "`nGunakan Remote Desktop (mstsc) dan masukkan IP atau MagicDNS di atas." -ForegroundColor Cyan
 
-      # 6️⃣ Jaga agar sesi tetap hidup selama 12 jam
-      - name: Keep Session Alive
+      # 6️⃣ Keep Session Alive (Tanpa Batas Waktu)
+      - name: Keep Runner Alive
         shell: pwsh
         run: |
-          Write-Host "🕒 Menjaga sesi RDP aktif selama 12 jam (720 menit)..."
-          for ($i=0; $i -lt 720; $i++) {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session RDP aktif..."
-            Start-Sleep -Seconds 60
+          Write-Host "🟢 Menjaga sesi tetap hidup (infinite loop)..." -ForegroundColor Cyan
+          Write-Host "Tekan Ctrl+C di GitHub jika ingin menghentikan manual." -ForegroundColor Yellow
+          
+          $counter = 0
+          while ($true) {
+              $counter++
+              $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$time] Session masih aktif - Loop ke-$counter" -ForegroundColor Gray
+              
+              # Cek Tailscale masih connect setiap 10 menit
+              if ($counter % 10 -eq 0) {
+                  $ts = "C:\Program Files\Tailscale\tailscale.exe"
+                  if (-not (& $ts status | Select-String "logged in")) {
+                      Write-Host "⚠️ Tailscale terputus, mencoba reconnect..." -ForegroundColor Yellow
+                      & $ts up --accept-dns=true --accept-routes=true --unattended=true
+                  }
+              }
+              
+              Start-Sleep -Seconds 60
           }
