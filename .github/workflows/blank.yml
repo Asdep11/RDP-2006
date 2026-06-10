@@ -1,0 +1,53 @@
+# ================================================
+# Setup RDP via Tailscale - Windows
+# Jalankan sebagai Administrator
+# ================================================
+
+param(
+    [switch]$EnableUnattended = $true
+)
+
+Write-Host "=== Setup RDP + Tailscale ===" -ForegroundColor Cyan
+
+# 1. Cek Tailscale terinstall
+if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+    Write-Host "Tailscale belum terinstall. Silakan download dari https://tailscale.com/download" -ForegroundColor Red
+    Write-Host "Setelah install, jalankan script ini lagi."
+    exit 1
+}
+
+# 2. Status Tailscale
+Write-Host "`nStatus Tailscale saat ini:" -ForegroundColor Yellow
+tailscale status
+
+# 3. Enable RDP (jika belum)
+Write-Host "`nMengaktifkan Remote Desktop..." -ForegroundColor Yellow
+$rdpRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+Set-ItemProperty -Path $rdpRegPath -Name "fDenyTSConnections" -Value 0 -Type DWord -Force
+
+# Enable firewall rule
+netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+
+# Optional: Enable Network Level Authentication (lebih aman)
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -Type DWord -Force
+
+Write-Host "RDP telah diaktifkan." -ForegroundColor Green
+
+# 4. Tailscale Unattended Mode (supaya tetap connect setelah reboot)
+if ($EnableUnattended) {
+    Write-Host "`nMengaktifkan Unattended Mode..." -ForegroundColor Yellow
+    tailscale set --unattended=true
+    Write-Host "Unattended mode diaktifkan." -ForegroundColor Green
+}
+
+# 5. Tampilkan IP Tailscale
+Write-Host "`nIP Tailscale Anda:" -ForegroundColor Cyan
+$tsIP = tailscale ip -4
+Write-Host $tsIP -ForegroundColor Green
+
+Write-Host "`nHostname MagicDNS (jika diaktifkan di admin console):" -ForegroundColor Cyan
+tailscale status --json | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName
+
+Write-Host "`n`n✅ SETUP SELESAI!" -ForegroundColor Green
+Write-Host "Gunakan IP atau hostname di atas untuk koneksi RDP dari client lain." -ForegroundColor White
+Write-Host "Contoh koneksi: mstsc /v:$tsIP"
