@@ -1,53 +1,83 @@
-# ================================================
-# Setup RDP via Tailscale - Windows
-# Jalankan sebagai Administrator
-# ================================================
+name: RDP via Tailscale
+on:
+  workflow_dispatch:
 
-param(
-    [switch]$EnableUnattended = $true
-)
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 180
 
-Write-Host "=== Setup RDP + Tailscale ===" -ForegroundColor Cyan
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-# 1. Cek Tailscale terinstall
-if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
-    Write-Host "Tailscale belum terinstall. Silakan download dari https://tailscale.com/download" -ForegroundColor Red
-    Write-Host "Setelah install, jalankan script ini lagi."
-    exit 1
-}
+      # 1️⃣ Aktifkan RDP dan firewall
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Write-Host "🔧 Mengaktifkan RDP dan membuka firewall..."
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ Remote Desktop sudah aktif."
 
-# 2. Status Tailscale
-Write-Host "`nStatus Tailscale saat ini:" -ForegroundColor Yellow
-tailscale status
+      # 2️⃣ Buat user dengan password aman (≤14 karakter, ASCII khusus dihindari)
+      - name: Create Local Admin User
+        id: user
+        shell: pwsh
+        run: |
+          $password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 12 | ForEach-Object {[char]$_})
+          net user RDP $password /add /Y
+          net localgroup administrators RDP /add
+          Add-Content $env:GITHUB_ENV "RDP_PASSWORD=$password"
+          Write-Host "✅ User RDP dibuat: RDP / $password"
 
-# 3. Enable RDP (jika belum)
-Write-Host "`nMengaktifkan Remote Desktop..." -ForegroundColor Yellow
-$rdpRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
-Set-ItemProperty -Path $rdpRegPath -Name "fDenyTSConnections" -Value 0 -Type DWord -Force
+      # 3️⃣ Instal Tailscale menggunakan EXE (hindari MSI error)
+      - name: Install Tailscale Client
+        shell: pwsh
+        run: |
+          Write-Host "📦 Menginstal Tailscale..."
+          $exe = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $exe
+          Start-Process $exe -ArgumentList "/quiet /norestart" -Wait
+          Write-Host "✅ Instalasi Tailscale selesai."
 
-# Enable firewall rule
-netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+      # 4️⃣ Hubungkan runner ke jaringan Tailscale
+      - name: Connect to Tailscale Network
+        shell: pwsh
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $authkey = "${{ secrets.TS_AUTH_KEY }}"
+          if ([string]::IsNullOrEmpty($authkey)) {
+            Write-Host "⚠️ Auth Key tidak ditemukan! Jalankan login manual..."
+            & $ts up --hostname=gh-runner-${{ github.run_id }} --accept-dns=true --accept-routes=true
+          } else {
+            Write-Host "🔐 Menghubungkan node ke Tailnet..."
+            & $ts up --auth-key=$authkey --hostname=gh-runner-${{ github.run_id }} --accept-dns=true --accept-routes=true
+          }
+          if ($LASTEXITCODE -ne 0) { throw "❌ Gagal connect ke Tailnet." }
+          Write-Host "✅ Node tersambung ke Tailnet."
 
-# Optional: Enable Network Level Authentication (lebih aman)
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -Type DWord -Force
+      # 5️⃣ Tampilkan IP Tailscale dan kredensial akses RDP
+      - name: Display Access Information
+        shell: pwsh
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = & $ts ip -4
+          Write-Host "`n==============================="
+          Write-Host "✅ Tailscale dan RDP Siap Digunakan"
+          Write-Host "🌐 IP Tailscale: $ip"
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: $env:RDP_PASSWORD"
+          Write-Host "Gunakan aplikasi mstsc.exe dengan IP di atas."
+          Write-Host "==============================="
 
-Write-Host "RDP telah diaktifkan." -ForegroundColor Green
-
-# 4. Tailscale Unattended Mode (supaya tetap connect setelah reboot)
-if ($EnableUnattended) {
-    Write-Host "`nMengaktifkan Unattended Mode..." -ForegroundColor Yellow
-    tailscale set --unattended=true
-    Write-Host "Unattended mode diaktifkan." -ForegroundColor Green
-}
-
-# 5. Tampilkan IP Tailscale
-Write-Host "`nIP Tailscale Anda:" -ForegroundColor Cyan
-$tsIP = tailscale ip -4
-Write-Host $tsIP -ForegroundColor Green
-
-Write-Host "`nHostname MagicDNS (jika diaktifkan di admin console):" -ForegroundColor Cyan
-tailscale status --json | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName
-
-Write-Host "`n`n✅ SETUP SELESAI!" -ForegroundColor Green
-Write-Host "Gunakan IP atau hostname di atas untuk koneksi RDP dari client lain." -ForegroundColor White
-Write-Host "Contoh koneksi: mstsc /v:$tsIP"
+      # 6️⃣ Jaga agar sesi tetap hidup selama 12 jam
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          Write-Host "🕒 Menjaga sesi RDP aktif selama 12 jam (720 menit)..."
+          for ($i=0; $i -lt 720; $i++) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session RDP aktif..."
+            Start-Sleep -Seconds 60
+          }
